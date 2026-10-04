@@ -213,6 +213,56 @@ println(value)
 // {"friends":["Andy"]}
 ```
 
+Batch editing
+-------------
+
+`SetBytesBatch` (and its string variant `SetBatch`) applies an ordered
+list of set/delete operations in one call:
+
+```go
+res, err := sjson.SetBytesBatch(
+	[]byte(`{"arr":["a","b","c"]}`),
+	[]sjson.BatchOp{
+		sjson.BatchDelete("arr.0"),   // delete the first element
+		sjson.BatchSet("arr.1", "z"), // modifies the original "c"
+	},
+)
+// res.JSON == {"arr":["b","z"]}
+```
+
+Each operation runs against the document produced by the previous
+operation, reusing the same raw byte splicing as `SetBytes` and
+`DeleteBytes`. If an earlier operation changed the document length or
+shifted array indices, the next operation is relocated against the new
+structure; stale offsets are never reused.
+
+The batch is atomic: if any operation has an invalid path or a value
+that is not valid JSON, a `*BatchError` (with the failing operation
+index) is returned and `res.JSON` holds the complete original input —
+no partial result is published. The input bytes are never modified.
+
+An empty path targets the root document, so `BatchSetRaw("", "[1,2,3]")`
+replaces the whole document (deleting the root is an error).
+
+For every executed operation, `res.Ops[i]` reports the minimal changed
+region as half-open byte intervals:
+
+- `Before` — the changed bytes in the document before the operation
+  (the old value for a set, the removed bytes for a delete, a
+  zero-width insertion point for a new member).
+- `After` — the changed bytes in the document after the operation
+  (the new value for a set, a zero-width collapse point for a delete).
+
+All intervals are relative to the document version they refer to, so
+`Ops[i].After` and `Ops[i+1].Before` index into the same intermediate
+document.
+
+Run only the batch tests with:
+
+```sh
+go test -run Batch ./
+```
+
 ## Performance
 
 Benchmarks of SJSON alongside [encoding/json](https://golang.org/pkg/encoding/json/), 
