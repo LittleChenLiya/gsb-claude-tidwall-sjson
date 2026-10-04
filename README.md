@@ -213,6 +213,74 @@ println(value)
 // {"friends":["Andy"]}
 ```
 
+## Batch editing
+
+Use `SetBatch` to apply a sequence of path set/delete operations in order.
+Each operation is re-located in the document produced by the previous one,
+so changing the length of a value or deleting an array element does not
+invalidate later paths. If any operation has an invalid path or a value that
+is not valid JSON, the whole batch is aborted and the original input is
+returned unchanged.
+
+```go
+json := []byte(`{"name":{"first":"Janet","last":"Prichard"},"age":47}`)
+value, results, err := sjson.SetBatch(json,
+    sjson.SetOp("name.last", `"Anderson"`),
+    sjson.SetOp("age", `48`),
+)
+println(string(value))
+
+// Output:
+// {"name":{"first":"Janet","last":"Anderson"},"age":48}
+```
+
+A string or `[]byte` value is treated as raw JSON text and must include its
+quotes. Other types are marshaled with `encoding/json`:
+
+```go
+sjson.SetOp("name", `"Tom"`)   // raw JSON string
+sjson.SetOp("age", 48)         // marshaled to 48
+sjson.SetOp("tags", []string{"a","b"}) // marshaled to ["a","b"]
+```
+
+Use `DeleteOp` to delete a value. The empty path means the root document:
+
+```go
+value, _, _ := sjson.SetBatch([]byte(`{"a":1,"b":2}`),
+    sjson.DeleteOp("a"),
+    sjson.SetOp("", `{"root":true}`),
+)
+// value == `{"root":true}`
+```
+
+### Operation ranges
+
+Each result describes the byte range replaced in the input document
+(`Before`) and the byte range occupied by the replacement text in the
+output document (`After`). A zero-length `Before` means a newly inserted
+value; a zero-length `After` means a deletion.
+
+```go
+json := []byte(`{"a":"short","b":"end"}`)
+_, results, _ := sjson.SetBatch(json,
+    sjson.SetOp("a", `"a much longer string"`),
+    sjson.SetOp("b", `"done"`),
+)
+// results[0].Before == Span{Start:5, End:12}  // `"short"` in the input
+// results[0].After  == Span{Start:5, End:27}  // `"a much longer string"` in the output
+// results[1].Before == Span{Start:32, End:37} // `"end"` in the intermediate doc
+// results[1].After  == Span{Start:32, End:38} // `"done"` in the output
+```
+
+The input bytes are never modified. On failure the returned bytes are the
+original input and no results are published.
+
+### Running the batch tests
+
+```sh
+go test -run TestBatch -v .
+```
+
 ## Performance
 
 Benchmarks of SJSON alongside [encoding/json](https://golang.org/pkg/encoding/json/), 

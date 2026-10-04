@@ -247,8 +247,20 @@ loop:
 
 var errNoChange = &errorType{"no change"}
 
+// splice describes a single text replacement performed on a json document.
+// index and length identify the replaced span in the document passed to the
+// call; postIndex and postLen identify the replacement span in the document
+// returned by the call. A zero length means an insertion, a zero postLen
+// means a deletion.
+type splice struct {
+	index     int
+	length    int
+	postIndex int
+	postLen   int
+}
+
 func appendRawPaths(buf []byte, jstr string, paths []pathResult, raw string,
-	stringify, del bool) ([]byte, error) {
+	stringify, del bool) ([]byte, splice, error) {
 	var err error
 	var res gjson.Result
 	var found bool
@@ -267,19 +279,24 @@ func appendRawPaths(buf []byte, jstr string, paths []pathResult, raw string,
 	if res.Index > 0 {
 		if len(paths) > 1 {
 			buf = append(buf, jstr[:res.Index]...)
-			buf, err = appendRawPaths(buf, res.Raw, paths[1:], raw,
+			var sp splice
+			buf, sp, err = appendRawPaths(buf, res.Raw, paths[1:], raw,
 				stringify, del)
 			if err != nil {
-				return nil, err
+				return nil, sp, err
 			}
+			sp.index += res.Index
 			buf = append(buf, jstr[res.Index+len(res.Raw):]...)
-			return buf, nil
+			return buf, sp, nil
 		}
 		buf = append(buf, jstr[:res.Index]...)
+		postIndex := len(buf)
 		var exidx int // additional forward stripping
 		if del {
 			var delNextComma bool
 			buf, delNextComma = deleteTailItem(buf)
+			stripped := postIndex - len(buf)
+			removedStart := res.Index - stripped
 			if delNextComma {
 				i, j := res.Index+len(res.Raw), 0
 				for ; i < len(jstr); i, j = i+1, j+1 {
@@ -292,18 +309,38 @@ func appendRawPaths(buf []byte, jstr string, paths []pathResult, raw string,
 					break
 				}
 			}
-		} else {
-			if stringify {
-				buf = appendStringify(buf, raw)
-			} else {
-				buf = append(buf, raw...)
+			removedEnd := res.Index + len(res.Raw) + exidx
+			sp := splice{
+				index:     removedStart,
+				length:    removedEnd - removedStart,
+				postIndex: len(buf),
+				postLen:   0,
 			}
+			buf = append(buf, jstr[res.Index+len(res.Raw)+exidx:]...)
+			return buf, sp, nil
+		}
+		var newRawLen int
+		if stringify {
+			newRawLen = len(appendStringify(nil, raw))
+		} else {
+			newRawLen = len(raw)
+		}
+		sp := splice{
+			index:     res.Index,
+			length:    len(res.Raw),
+			postIndex: postIndex,
+			postLen:   newRawLen,
+		}
+		if stringify {
+			buf = appendStringify(buf, raw)
+		} else {
+			buf = append(buf, raw...)
 		}
 		buf = append(buf, jstr[res.Index+len(res.Raw)+exidx:]...)
-		return buf, nil
+		return buf, sp, nil
 	}
 	if del {
-		return nil, errNoChange
+		return nil, splice{}, errNoChange
 	}
 	n, numeric := atoui(paths[0])
 	isempty := true
@@ -313,6 +350,7 @@ func appendRawPaths(buf []byte, jstr string, paths []pathResult, raw string,
 			break
 		}
 	}
+	rebuilt := isempty
 	if isempty {
 		if numeric {
 			jstr = "[]"
@@ -322,6 +360,7 @@ func appendRawPaths(buf []byte, jstr string, paths []pathResult, raw string,
 	}
 	jsres := gjson.Parse(jstr)
 	if jsres.Type != gjson.JSON {
+		rebuilt = true
 		if numeric {
 			jstr = "[]"
 		} else {
@@ -342,7 +381,7 @@ func appendRawPaths(buf []byte, jstr string, paths []pathResult, raw string,
 	}
 	switch jsres.Raw[0] {
 	default:
-		return nil, &errorType{"json must be an object or array"}
+		return nil, splice{}, &errorType{"json must be an object or array"}
 	case '{':
 		end := len(jsres.Raw) - 1
 		for ; end > 0; end-- {
@@ -350,20 +389,31 @@ func appendRawPaths(buf []byte, jstr string, paths []pathResult, raw string,
 				break
 			}
 		}
+		insIdx := end
+		if rebuilt {
+			insIdx = 0
+		}
 		buf = append(buf, jsres.Raw[:end]...)
+		insertStart := len(buf)
 		if comma {
 			buf = append(buf, ',')
 		}
 		buf = appendBuild(buf, false, paths, raw, stringify)
+		sp := splice{
+			index:     insIdx,
+			length:    0,
+			postIndex: insertStart,
+			postLen:   len(buf) - insertStart,
+		}
 		buf = append(buf, '}')
-		return buf, nil
+		return buf, sp, nil
 	case '[':
 		var appendit bool
 		if !numeric {
 			if paths[0].part == "-1" && !paths[0].force {
 				appendit = true
 			} else {
-				return nil, &errorType{
+				return nil, splice{}, &errorType{
 					"cannot set array element for non-numeric key '" +
 						paths[0].part + "'"}
 			}
@@ -373,14 +423,31 @@ func appendRawPaths(buf []byte, jstr string, paths []pathResult, raw string,
 			if njson[len(njson)-1] == ']' {
 				njson = njson[:len(njson)-1]
 			}
+			closeIdx := len(jstr)
+			for i := len(jstr) - 1; i >= 0; i-- {
+				if jstr[i] == ']' {
+					closeIdx = i
+					break
+				}
+			}
+			insIdx := closeIdx
+			if rebuilt {
+				insIdx = 0
+			}
 			buf = append(buf, njson...)
+			insertStart := len(buf)
 			if comma {
 				buf = append(buf, ',')
 			}
-
 			buf = appendBuild(buf, true, paths, raw, stringify)
+			sp := splice{
+				index:     insIdx,
+				length:    0,
+				postIndex: insertStart,
+				postLen:   len(buf) - insertStart,
+			}
 			buf = append(buf, ']')
-			return buf, nil
+			return buf, sp, nil
 		}
 		buf = append(buf, '[')
 		ress := jsres.Array()
@@ -390,6 +457,15 @@ func appendRawPaths(buf []byte, jstr string, paths []pathResult, raw string,
 			}
 			buf = append(buf, ress[i].Raw...)
 		}
+		insIdx := 1
+		if len(ress) > 0 {
+			last := ress[len(ress)-1]
+			insIdx = last.Index + len(last.Raw)
+		}
+		if rebuilt {
+			insIdx = 0
+		}
+		insertStart := len(buf)
 		if len(ress) == 0 {
 			buf = appendRepeat(buf, "null,", n-len(ress))
 		} else {
@@ -399,8 +475,14 @@ func appendRawPaths(buf []byte, jstr string, paths []pathResult, raw string,
 			}
 		}
 		buf = appendBuild(buf, true, paths, raw, stringify)
+		sp := splice{
+			index:     insIdx,
+			length:    0,
+			postIndex: insertStart,
+			postLen:   len(buf) - insertStart,
+		}
 		buf = append(buf, ']')
-		return buf, nil
+		return buf, sp, nil
 	}
 }
 
@@ -576,7 +658,7 @@ func set(jstr, path, raw string,
 		}
 		return setComplexPath(jstr, path, raw, stringify)
 	}
-	njson, err := appendRawPaths(nil, jstr, paths, raw, stringify, del)
+	njson, _, err := appendRawPaths(nil, jstr, paths, raw, stringify, del)
 	if err != nil {
 		return []byte(jstr), err
 	}
