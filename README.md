@@ -213,6 +213,54 @@ println(value)
 // {"friends":["Andy"]}
 ```
 
+Edit an array item by identity
+------------------------------
+
+When an array holds objects that each carry an identity field (such as `"id"`),
+`SetArrayItem` and `DeleteArrayItem` edit the element whose identity field
+matches a given value, regardless of its position in the array.
+
+The whole target array is scanned before any edit is applied: every element must
+expose the identity field as a scalar (string, number or boolean) and every
+identity must be unique. A missing identity, a non-scalar identity or a
+duplicate identity all report the element position(s) and return the original
+unchanged text.
+
+Numbers and strings are never considered equal even when their textual
+representations match: the string `"1"` and the number `1` are two different
+identities. The edit is applied at the original byte position of the matched
+element, so the bytes of every unselected element are preserved exactly.
+
+```go
+value, _ := sjson.SetArrayItem(
+	`{"friends":[{"id":"a","v":1},{"id":"b","v":2}]}`,
+	"friends", "id", "b", map[string]interface{}{"id": "b", "v": 20})
+println(value)
+
+// Output:
+// {"friends":[{"id":"a","v":1},{"id":"b","v":20}]}
+```
+
+Delete an array item by identity:
+```go
+value, _ := sjson.DeleteArrayItem(
+	`{"friends":[{"id":"a","v":1},{"id":"b","v":2}]}`,
+	"friends", "id", "b")
+println(value)
+
+// Output:
+// {"friends":[{"id":"a","v":1}]}
+```
+
+The byte-slice entry points (`SetArrayItemBytes`, `SetArrayItemRawBytes` and
+`DeleteArrayItemBytes`) are also available.
+
+Run the targeted tests for this feature with:
+
+```sh
+go test -run 'ArrayItem' -v .
+```
+
 ## Performance
 
 Benchmarks of SJSON alongside [encoding/json](https://golang.org/pkg/encoding/json/), 
