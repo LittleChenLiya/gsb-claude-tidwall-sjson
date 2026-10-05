@@ -213,6 +213,59 @@ println(value)
 // {"friends":["Andy"]}
 ```
 
+Set or delete an array element by identity field
+------------------------------------------------
+
+`SetByID` and `DeleteByID` edit the single array element whose identity
+field matches a given scalar, instead of using a numeric position.
+The whole array is validated before anything changes: every element must
+carry a scalar (string, number, or bool) identity and all identities must
+be unique, otherwise an error reporting the array index positions is
+returned and the json is left unchanged. Matching is type-strict, so the
+string `"1"` and the number `1` are different identities. Only the matched
+element's bytes are replaced or removed; all other bytes stay untouched.
+
+Update the element with `"id":"b"` in a two-item array, no matter where
+it sits:
+
+```go
+const json = `{"users":[{"id":"a","v":1},{"id":"b","v":2}]}`
+
+value, _ := sjson.SetByID(json, "users", "id", "b",
+	map[string]interface{}{"id": "b", "v": 9})
+println(value)
+
+// Output:
+// {"users":[{"id":"a","v":1},{"id":"b","v":9}]}
+```
+
+Delete the element with `"id":"a"` from the same two-item array:
+
+```go
+value, _ := sjson.DeleteByID(json, "users", "id", "a")
+println(value)
+
+// Output:
+// {"users":[{"id":"b","v":2}]}
+```
+
+Two elements sharing the same identity are rejected before any edit:
+
+```go
+_, err := sjson.SetByID(`{"users":[{"id":"b"},{"id":"b"}]}`,
+	"users", "id", "b", 1)
+println(err.Error())
+
+// Output:
+// duplicate identity "b" at array indexes 0 and 1
+```
+
+Run the targeted tests for these functions with:
+
+```sh
+go test -run 'TestSetByID|TestDeleteByID' ./
+```
+
 ## Performance
 
 Benchmarks of SJSON alongside [encoding/json](https://golang.org/pkg/encoding/json/), 
