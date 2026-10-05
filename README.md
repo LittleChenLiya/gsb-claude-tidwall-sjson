@@ -213,6 +213,47 @@ println(value)
 // {"friends":["Andy"]}
 ```
 
+Conditionally set or delete a value
+-----------------------------------
+
+`SetIf`, `SetBytesIf`, `SetRawIf`, `SetRawBytesIf`, `DeleteIf`, and
+`DeleteBytesIf` apply an explicit precondition on the existing value at the
+path. The condition is checked at the real target location during the same
+traversal that performs the update: object keys (including numeric keys such
+as `"0"`) and array indexes are distinguished by the actual container type.
+When the condition is not met, the input json is returned unchanged and no
+bytes are modified. Invalid caller values (for example raw json that does
+not parse) are rejected with an error before the condition is evaluated.
+
+Available conditions: `CondAny`, `CondMissing`, `CondExists`, `CondNull`,
+`CondBool`, `CondNumber`, `CondString`, `CondObject`, `CondArray`,
+`CondJSON`.
+
+Three update examples:
+
+```go
+// 1. set only when the path is missing (an existing null rejects)
+value, _ := sjson.SetIf(`{"name":"Tom"}`, "age", 37, sjson.CondMissing)
+println(value)
+// Output: {"name":"Tom","age":37}
+
+// 2. replace only when the original value is a string
+value, _ = sjson.SetIf(`{"a":"x","b":2}`, "a", "y", sjson.CondString)
+println(value)
+// Output: {"a":"y","b":2}
+
+// 3. delete only when the original value is null
+value, _ = sjson.DeleteIf(`{"a":null,"b":1}`, "a", sjson.CondNull)
+println(value)
+// Output: {"b":1}
+```
+
+Run the conditional tests and examples with:
+
+```sh
+go test -run 'Cond|DeleteIf|SetRawIf|Example' -v ./...
+```
+
 ## Performance
 
 Benchmarks of SJSON alongside [encoding/json](https://golang.org/pkg/encoding/json/), 

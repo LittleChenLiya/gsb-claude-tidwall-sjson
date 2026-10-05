@@ -34,6 +34,72 @@ type Options struct {
 	ReplaceInPlace bool
 }
 
+// Cond is a precondition on the existing value at the target path for the
+// conditional SetIf/DeleteIf family of functions. The condition is checked
+// at the real target location during the same parse/traversal pass that
+// performs the update: object keys (including numeric-looking keys such as
+// "0") and array indexes are distinguished by the actual type of the
+// container being traversed. When the condition is not met, the input json
+// is returned unchanged and no bytes are modified.
+type Cond int
+
+const (
+	// CondAny imposes no precondition. The update always proceeds.
+	CondAny Cond = iota
+	// CondMissing requires that no value exists at the path. An existing
+	// null value counts as existing and rejects the update.
+	CondMissing
+	// CondExists requires that a value of any type exists at the path.
+	CondExists
+	// CondNull requires the existing value to be json null.
+	CondNull
+	// CondBool requires the existing value to be true or false.
+	CondBool
+	// CondNumber requires the existing value to be a number.
+	CondNumber
+	// CondString requires the existing value to be a string.
+	CondString
+	// CondObject requires the existing value to be a json object.
+	CondObject
+	// CondArray requires the existing value to be a json array.
+	CondArray
+	// CondJSON requires the existing value to be a json object or array.
+	CondJSON
+)
+
+// condSatisfied reports whether the condition cond holds for the value res
+// found at the target path. exists is false when the path does not exist.
+func condSatisfied(cond Cond, res gjson.Result, exists bool) bool {
+	switch cond {
+	case CondAny:
+		return true
+	case CondMissing:
+		return !exists
+	case CondExists:
+		return exists
+	}
+	if !exists {
+		return false
+	}
+	switch cond {
+	case CondNull:
+		return res.Type == gjson.Null
+	case CondBool:
+		return res.Type == gjson.True || res.Type == gjson.False
+	case CondNumber:
+		return res.Type == gjson.Number
+	case CondString:
+		return res.Type == gjson.String
+	case CondObject:
+		return res.IsObject()
+	case CondArray:
+		return res.IsArray()
+	case CondJSON:
+		return res.Type == gjson.JSON
+	}
+	return false
+}
+
 type pathResult struct {
 	part  string // current key part
 	gpart string // gjson get part
@@ -248,7 +314,7 @@ loop:
 var errNoChange = &errorType{"no change"}
 
 func appendRawPaths(buf []byte, jstr string, paths []pathResult, raw string,
-	stringify, del bool) ([]byte, error) {
+	stringify, del bool, cond Cond) ([]byte, error) {
 	var err error
 	var res gjson.Result
 	var found bool
@@ -268,12 +334,18 @@ func appendRawPaths(buf []byte, jstr string, paths []pathResult, raw string,
 		if len(paths) > 1 {
 			buf = append(buf, jstr[:res.Index]...)
 			buf, err = appendRawPaths(buf, res.Raw, paths[1:], raw,
-				stringify, del)
+				stringify, del, cond)
 			if err != nil {
 				return nil, err
 			}
 			buf = append(buf, jstr[res.Index+len(res.Raw):]...)
 			return buf, nil
+		}
+		// The target exists at this real location. Verify the condition
+		// against the value found here, in this same parse state, before
+		// modifying any bytes.
+		if !condSatisfied(cond, res, true) {
+			return nil, errNoChange
 		}
 		buf = append(buf, jstr[:res.Index]...)
 		var exidx int // additional forward stripping
@@ -303,6 +375,11 @@ func appendRawPaths(buf []byte, jstr string, paths []pathResult, raw string,
 		return buf, nil
 	}
 	if del {
+		return nil, errNoChange
+	}
+	// The target does not exist; a new value would be created here. Only
+	// conditions that accept a missing value may proceed.
+	if !condSatisfied(cond, gjson.Result{}, false) {
 		return nil, errNoChange
 	}
 	n, numeric := atoui(paths[0])
@@ -466,7 +543,8 @@ func SetRawOptions(json, path, value string, opts *Options) (string, error) {
 	if opts != nil {
 		optimistic = opts.Optimistic
 	}
-	res, err := set(json, path, value, false, false, optimistic, false)
+	res, err := set(json, path, value, false, false, optimistic, false,
+		CondAny)
 	if err == errNoChange {
 		return json, nil
 	}
@@ -514,7 +592,7 @@ type sliceHeader struct {
 }
 
 func set(jstr, path, raw string,
-	stringify, del, optimistic, inplace bool) ([]byte, error) {
+	stringify, del, optimistic, inplace bool, cond Cond) ([]byte, error) {
 	if path == "" {
 		return []byte(jstr), &errorType{"path cannot be empty"}
 	}
@@ -574,9 +652,13 @@ func set(jstr, path, raw string,
 			return []byte(jstr),
 				&errorType{"cannot delete value from a complex path"}
 		}
+		if cond != CondAny {
+			return []byte(jstr),
+				&errorType{"cannot use a condition with a complex path"}
+		}
 		return setComplexPath(jstr, path, raw, stringify)
 	}
-	njson, err := appendRawPaths(nil, jstr, paths, raw, stringify, del)
+	njson, err := appendRawPaths(nil, jstr, paths, raw, stringify, del, cond)
 	if err != nil {
 		return []byte(jstr), err
 	}
@@ -656,6 +738,55 @@ func SetOptions(json, path string, value interface{},
 	return string(res), err
 }
 
+// valueToRaw converts a user value into its raw json representation.
+// It reports whether the value must be stringified (string/[]byte) and
+// whether the value requests a delete (dtype). A marshaling error is
+// returned before any json parsing or condition checking takes place.
+func valueToRaw(value interface{}) (raw string, stringify, del bool,
+	err error) {
+	switch v := value.(type) {
+	default:
+		b, merr := jsongo.Marshal(value)
+		if merr != nil {
+			return "", false, false, merr
+		}
+		return *(*string)(unsafe.Pointer(&b)), false, false, nil
+	case dtype:
+		return "", false, true, nil
+	case string:
+		return v, true, false, nil
+	case []byte:
+		return *(*string)(unsafe.Pointer(&v)), true, false, nil
+	case bool:
+		if v {
+			return "true", false, false, nil
+		}
+		return "false", false, false, nil
+	case int8:
+		return strconv.FormatInt(int64(v), 10), false, false, nil
+	case int16:
+		return strconv.FormatInt(int64(v), 10), false, false, nil
+	case int32:
+		return strconv.FormatInt(int64(v), 10), false, false, nil
+	case int64:
+		return strconv.FormatInt(int64(v), 10), false, false, nil
+	case uint8:
+		return strconv.FormatUint(uint64(v), 10), false, false, nil
+	case uint16:
+		return strconv.FormatUint(uint64(v), 10), false, false, nil
+	case uint32:
+		return strconv.FormatUint(uint64(v), 10), false, false, nil
+	case uint64:
+		return strconv.FormatUint(uint64(v), 10), false, false, nil
+	case float32:
+		return strconv.FormatFloat(float64(v), 'f', -1, 64),
+			false, false, nil
+	case float64:
+		return strconv.FormatFloat(float64(v), 'f', -1, 64),
+			false, false, nil
+	}
+}
+
 // SetBytesOptions sets a json value for the specified path with options.
 // If working with bytes, this method preferred over
 // SetOptions(string(data), path, value)
@@ -667,60 +798,12 @@ func SetBytesOptions(json []byte, path string, value interface{},
 		inplace = opts.ReplaceInPlace
 	}
 	jstr := *(*string)(unsafe.Pointer(&json))
-	var res []byte
-	var err error
-	switch v := value.(type) {
-	default:
-		b, merr := jsongo.Marshal(value)
-		if merr != nil {
-			return nil, merr
-		}
-		raw := *(*string)(unsafe.Pointer(&b))
-		res, err = set(jstr, path, raw, false, false, optimistic, inplace)
-	case dtype:
-		res, err = set(jstr, path, "", false, true, optimistic, inplace)
-	case string:
-		res, err = set(jstr, path, v, true, false, optimistic, inplace)
-	case []byte:
-		raw := *(*string)(unsafe.Pointer(&v))
-		res, err = set(jstr, path, raw, true, false, optimistic, inplace)
-	case bool:
-		if v {
-			res, err = set(jstr, path, "true", false, false, optimistic, inplace)
-		} else {
-			res, err = set(jstr, path, "false", false, false, optimistic, inplace)
-		}
-	case int8:
-		res, err = set(jstr, path, strconv.FormatInt(int64(v), 10),
-			false, false, optimistic, inplace)
-	case int16:
-		res, err = set(jstr, path, strconv.FormatInt(int64(v), 10),
-			false, false, optimistic, inplace)
-	case int32:
-		res, err = set(jstr, path, strconv.FormatInt(int64(v), 10),
-			false, false, optimistic, inplace)
-	case int64:
-		res, err = set(jstr, path, strconv.FormatInt(int64(v), 10),
-			false, false, optimistic, inplace)
-	case uint8:
-		res, err = set(jstr, path, strconv.FormatUint(uint64(v), 10),
-			false, false, optimistic, inplace)
-	case uint16:
-		res, err = set(jstr, path, strconv.FormatUint(uint64(v), 10),
-			false, false, optimistic, inplace)
-	case uint32:
-		res, err = set(jstr, path, strconv.FormatUint(uint64(v), 10),
-			false, false, optimistic, inplace)
-	case uint64:
-		res, err = set(jstr, path, strconv.FormatUint(uint64(v), 10),
-			false, false, optimistic, inplace)
-	case float32:
-		res, err = set(jstr, path, strconv.FormatFloat(float64(v), 'f', -1, 64),
-			false, false, optimistic, inplace)
-	case float64:
-		res, err = set(jstr, path, strconv.FormatFloat(float64(v), 'f', -1, 64),
-			false, false, optimistic, inplace)
+	raw, stringify, del, err := valueToRaw(value)
+	if err != nil {
+		return nil, err
 	}
+	res, err := set(jstr, path, raw, stringify, del, optimistic, inplace,
+		CondAny)
 	if err == errNoChange {
 		return json, nil
 	}
@@ -739,9 +822,96 @@ func SetRawBytesOptions(json []byte, path string, value []byte,
 		optimistic = opts.Optimistic
 		inplace = opts.ReplaceInPlace
 	}
-	res, err := set(jstr, path, vstr, false, false, optimistic, inplace)
+	res, err := set(jstr, path, vstr, false, false, optimistic, inplace,
+		CondAny)
 	if err == errNoChange {
 		return json, nil
 	}
 	return res, err
+}
+
+// SetIf sets a json value for the specified path only when the condition
+// cond holds for the existing value at that path. The condition is checked
+// at the real target location during the same traversal that performs the
+// update, so object keys (including numeric keys such as "0") and array
+// indexes are distinguished by the actual container type. When the
+// condition is not met the input json is returned unchanged and no bytes
+// are modified. A value that cannot be marshaled to json is rejected with
+// an error before the condition is evaluated.
+func SetIf(json, path string, value interface{}, cond Cond) (string, error) {
+	jsonh := *(*stringHeader)(unsafe.Pointer(&json))
+	jsonbh := sliceHeader{data: jsonh.data, len: jsonh.len, cap: jsonh.len}
+	jsonb := *(*[]byte)(unsafe.Pointer(&jsonbh))
+	res, err := SetBytesIf(jsonb, path, value, cond)
+	return string(res), err
+}
+
+// SetBytesIf sets a json value for the specified path only when the
+// condition cond holds for the existing value at that path.
+// If working with bytes, this method preferred over
+// SetIf(string(data), path, value, cond)
+func SetBytesIf(json []byte, path string, value interface{},
+	cond Cond) ([]byte, error) {
+	jstr := *(*string)(unsafe.Pointer(&json))
+	raw, stringify, del, err := valueToRaw(value)
+	if err != nil {
+		return nil, err
+	}
+	res, err := set(jstr, path, raw, stringify, del, false, false, cond)
+	if err == errNoChange {
+		return json, nil
+	}
+	return res, err
+}
+
+// SetRawIf sets a raw json value for the specified path only when the
+// condition cond holds for the existing value at that path. The raw value
+// must be valid json; an invalid value is rejected with an error before
+// the condition is evaluated and before any bytes are modified.
+func SetRawIf(json, path, value string, cond Cond) (string, error) {
+	if !jsongo.Valid([]byte(value)) {
+		return json, &errorType{"invalid raw json value"}
+	}
+	res, err := set(json, path, value, false, false, false, false, cond)
+	if err == errNoChange {
+		return json, nil
+	}
+	return string(res), err
+}
+
+// SetRawBytesIf sets a raw json value for the specified path only when the
+// condition cond holds for the existing value at that path. The raw value
+// must be valid json; an invalid value is rejected with an error before
+// the condition is evaluated and before any bytes are modified.
+// If working with bytes, this method preferred over
+// SetRawIf(string(data), path, string(value), cond)
+func SetRawBytesIf(json []byte, path string, value []byte,
+	cond Cond) ([]byte, error) {
+	if !jsongo.Valid(value) {
+		return json, &errorType{"invalid raw json value"}
+	}
+	jstr := *(*string)(unsafe.Pointer(&json))
+	vstr := *(*string)(unsafe.Pointer(&value))
+	res, err := set(jstr, path, vstr, false, false, false, false, cond)
+	if err == errNoChange {
+		return json, nil
+	}
+	return res, err
+}
+
+// DeleteIf deletes a value from json for the specified path only when the
+// condition cond holds for the existing value at that path. The condition
+// is checked at the real target location, honoring the actual type of each
+// parent container along the path. When the condition is not met the input
+// json is returned unchanged and no bytes are modified.
+func DeleteIf(json, path string, cond Cond) (string, error) {
+	return SetIf(json, path, dtype{}, cond)
+}
+
+// DeleteBytesIf deletes a value from json for the specified path only when
+// the condition cond holds for the existing value at that path.
+// If working with bytes, this method preferred over
+// DeleteIf(string(data), path, cond)
+func DeleteBytesIf(json []byte, path string, cond Cond) ([]byte, error) {
+	return SetBytesIf(json, path, dtype{}, cond)
 }
