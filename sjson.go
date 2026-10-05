@@ -18,6 +18,33 @@ func (err *errorType) Error() string {
 	return err.msg
 }
 
+// Condition is a requirement that must be satisfied by the existing value
+// at a path before a conditional Set or Delete is applied. The condition is
+// verified at the real target position using the same parse state as the
+// update, so object numeric keys are never mistaken for array indices.
+type Condition uint8
+
+const (
+	// CondNone applies no condition; the operation is unconditional and
+	// behaves exactly like the ordinary Set or Delete.
+	CondNone Condition = iota
+	// CondMissing requires that the path does not exist. An existing null
+	// value does not satisfy this condition because the key is present.
+	CondMissing
+	// CondNull requires that the existing value is JSON null.
+	CondNull
+	// CondString requires that the existing value is a JSON string.
+	CondString
+	// CondNumber requires that the existing value is a JSON number.
+	CondNumber
+	// CondBool requires that the existing value is a JSON boolean.
+	CondBool
+	// CondObject requires that the existing value is a JSON object.
+	CondObject
+	// CondArray requires that the existing value is a JSON array.
+	CondArray
+)
+
 // Options represents additional options for the Set and Delete functions.
 type Options struct {
 	// Optimistic is a hint that the value likely exists which
@@ -32,6 +59,11 @@ type Options struct {
 	// The Optimistic flag must be set to true and the input must be a
 	// byte slice in order to use this field.
 	ReplaceInPlace bool
+	// Condition is a requirement that must be satisfied by the existing
+	// value at the path before the operation is applied. When the
+	// condition is not met the input bytes are returned unchanged.
+	// The zero value CondNone applies no condition.
+	Condition Condition
 }
 
 type pathResult struct {
@@ -247,8 +279,34 @@ loop:
 
 var errNoChange = &errorType{"no change"}
 
+// checkCondition reports whether the existing value satisfies the condition.
+// It is called only when the target value exists (res.Index > 0), at the
+// real target position.
+func checkCondition(cond Condition, res gjson.Result) bool {
+	switch cond {
+	case CondNone:
+		return true
+	case CondMissing:
+		// the value exists, so it is not missing
+		return false
+	case CondNull:
+		return res.Type == gjson.Null
+	case CondString:
+		return res.Type == gjson.String
+	case CondNumber:
+		return res.Type == gjson.Number
+	case CondBool:
+		return res.Type == gjson.True || res.Type == gjson.False
+	case CondObject:
+		return res.Type == gjson.JSON && len(res.Raw) > 0 && res.Raw[0] == '{'
+	case CondArray:
+		return res.Type == gjson.JSON && len(res.Raw) > 0 && res.Raw[0] == '['
+	}
+	return true
+}
+
 func appendRawPaths(buf []byte, jstr string, paths []pathResult, raw string,
-	stringify, del bool) ([]byte, error) {
+	stringify, del bool, cond Condition) ([]byte, error) {
 	var err error
 	var res gjson.Result
 	var found bool
@@ -268,12 +326,18 @@ func appendRawPaths(buf []byte, jstr string, paths []pathResult, raw string,
 		if len(paths) > 1 {
 			buf = append(buf, jstr[:res.Index]...)
 			buf, err = appendRawPaths(buf, res.Raw, paths[1:], raw,
-				stringify, del)
+				stringify, del, cond)
 			if err != nil {
 				return nil, err
 			}
 			buf = append(buf, jstr[res.Index+len(res.Raw):]...)
 			return buf, nil
+		}
+		// The target exists at the real target position. Verify the
+		// condition before applying the update so that a mismatch leaves
+		// the input bytes untouched.
+		if cond != CondNone && !checkCondition(cond, res) {
+			return nil, errNoChange
 		}
 		buf = append(buf, jstr[:res.Index]...)
 		var exidx int // additional forward stripping
@@ -303,6 +367,12 @@ func appendRawPaths(buf []byte, jstr string, paths []pathResult, raw string,
 		return buf, nil
 	}
 	if del {
+		return nil, errNoChange
+	}
+	// The target does not exist. Only CondMissing (and CondNone) can be
+	// satisfied by a missing value; any other condition leaves the bytes
+	// unchanged.
+	if cond != CondNone && cond != CondMissing {
 		return nil, errNoChange
 	}
 	n, numeric := atoui(paths[0])
@@ -427,19 +497,18 @@ func isOptimisticPath(path string) bool {
 //
 // A path is a series of keys separated by a dot.
 //
-//  {
-//    "name": {"first": "Tom", "last": "Anderson"},
-//    "age":37,
-//    "children": ["Sara","Alex","Jack"],
-//    "friends": [
-//      {"first": "James", "last": "Murphy"},
-//      {"first": "Roger", "last": "Craig"}
-//    ]
-//  }
-//  "name.last"          >> "Anderson"
-//  "age"                >> 37
-//  "children.1"         >> "Alex"
-//
+//	{
+//	  "name": {"first": "Tom", "last": "Anderson"},
+//	  "age":37,
+//	  "children": ["Sara","Alex","Jack"],
+//	  "friends": [
+//	    {"first": "James", "last": "Murphy"},
+//	    {"first": "Roger", "last": "Craig"}
+//	  ]
+//	}
+//	"name.last"          >> "Anderson"
+//	"age"                >> 37
+//	"children.1"         >> "Alex"
 func Set(json, path string, value interface{}) (string, error) {
 	return SetOptions(json, path, value, nil)
 }
@@ -463,10 +532,12 @@ func SetRaw(json, path, value string) (string, error) {
 // as a raw block of json. This allows for setting premarshalled json objects.
 func SetRawOptions(json, path, value string, opts *Options) (string, error) {
 	var optimistic bool
+	var cond Condition
 	if opts != nil {
 		optimistic = opts.Optimistic
+		cond = opts.Condition
 	}
-	res, err := set(json, path, value, false, false, optimistic, false)
+	res, err := set(json, path, value, false, false, optimistic, false, cond)
 	if err == errNoChange {
 		return json, nil
 	}
@@ -502,6 +573,59 @@ func DeleteBytesOptions(json []byte, path string, options *Options) ([]byte, err
 	return SetBytesOptions(json, path, dtype{}, options)
 }
 
+// SetIf sets a json value for the specified path only when the existing
+// value satisfies cond. When the condition is not met the input bytes are
+// returned unchanged and no error is returned. Use CondNone for an
+// unconditional Set.
+func SetIf(json, path string, value interface{}, cond Condition) (string, error) {
+	return SetOptions(json, path, value, &Options{Condition: cond})
+}
+
+// SetBytesIf sets a json value for the specified path only when the existing
+// value satisfies cond. When the condition is not met the input bytes are
+// returned unchanged and no error is returned.
+func SetBytesIf(json []byte, path string, value interface{}, cond Condition) ([]byte, error) {
+	return SetBytesOptions(json, path, value, &Options{Condition: cond})
+}
+
+// SetRawIf sets a raw json value for the specified path only when the
+// existing value satisfies cond. When the condition is not met the input
+// bytes are returned unchanged and no error is returned. The raw value is
+// validated before the condition is checked, so a malformed value is
+// rejected first.
+func SetRawIf(json, path string, value string, cond Condition) (string, error) {
+	if !gjson.Valid(value) {
+		return json, &errorType{"invalid raw json value"}
+	}
+	return SetRawOptions(json, path, value, &Options{Condition: cond})
+}
+
+// SetRawBytesIf sets a raw json value for the specified path only when the
+// existing value satisfies cond. When the condition is not met the input
+// bytes are returned unchanged and no error is returned. The raw value is
+// validated before the condition is checked, so a malformed value is
+// rejected first.
+func SetRawBytesIf(json []byte, path string, value []byte, cond Condition) ([]byte, error) {
+	if !gjson.ValidBytes(value) {
+		return json, &errorType{"invalid raw json value"}
+	}
+	return SetRawBytesOptions(json, path, value, &Options{Condition: cond})
+}
+
+// DeleteIf deletes a value from json for the specified path only when the
+// existing value satisfies cond. When the condition is not met the input
+// bytes are returned unchanged and no error is returned.
+func DeleteIf(json, path string, cond Condition) (string, error) {
+	return SetIf(json, path, dtype{}, cond)
+}
+
+// DeleteBytesIf deletes a value from json for the specified path only when
+// the existing value satisfies cond. When the condition is not met the
+// input bytes are returned unchanged and no error is returned.
+func DeleteBytesIf(json []byte, path string, cond Condition) ([]byte, error) {
+	return SetBytesIf(json, path, dtype{}, cond)
+}
+
 type stringHeader struct {
 	data unsafe.Pointer
 	len  int
@@ -514,13 +638,16 @@ type sliceHeader struct {
 }
 
 func set(jstr, path, raw string,
-	stringify, del, optimistic, inplace bool) ([]byte, error) {
+	stringify, del, optimistic, inplace bool, cond Condition) ([]byte, error) {
 	if path == "" {
 		return []byte(jstr), &errorType{"path cannot be empty"}
 	}
 	if !del && optimistic && isOptimisticPath(path) {
 		res := gjson.Get(jstr, path)
 		if res.Exists() && res.Index > 0 {
+			if cond != CondNone && !checkCondition(cond, res) {
+				return []byte(jstr), errNoChange
+			}
 			sz := len(jstr) - len(res.Raw) + len(raw)
 			if stringify {
 				sz += 2
@@ -574,9 +701,13 @@ func set(jstr, path, raw string,
 			return []byte(jstr),
 				&errorType{"cannot delete value from a complex path"}
 		}
+		if cond != CondNone {
+			return []byte(jstr),
+				&errorType{"cannot apply condition to a complex path"}
+		}
 		return setComplexPath(jstr, path, raw, stringify)
 	}
-	njson, err := appendRawPaths(nil, jstr, paths, raw, stringify, del)
+	njson, err := appendRawPaths(nil, jstr, paths, raw, stringify, del, cond)
 	if err != nil {
 		return []byte(jstr), err
 	}
@@ -662,9 +793,11 @@ func SetOptions(json, path string, value interface{},
 func SetBytesOptions(json []byte, path string, value interface{},
 	opts *Options) ([]byte, error) {
 	var optimistic, inplace bool
+	var cond Condition
 	if opts != nil {
 		optimistic = opts.Optimistic
 		inplace = opts.ReplaceInPlace
+		cond = opts.Condition
 	}
 	jstr := *(*string)(unsafe.Pointer(&json))
 	var res []byte
@@ -676,50 +809,50 @@ func SetBytesOptions(json []byte, path string, value interface{},
 			return nil, merr
 		}
 		raw := *(*string)(unsafe.Pointer(&b))
-		res, err = set(jstr, path, raw, false, false, optimistic, inplace)
+		res, err = set(jstr, path, raw, false, false, optimistic, inplace, cond)
 	case dtype:
-		res, err = set(jstr, path, "", false, true, optimistic, inplace)
+		res, err = set(jstr, path, "", false, true, optimistic, inplace, cond)
 	case string:
-		res, err = set(jstr, path, v, true, false, optimistic, inplace)
+		res, err = set(jstr, path, v, true, false, optimistic, inplace, cond)
 	case []byte:
 		raw := *(*string)(unsafe.Pointer(&v))
-		res, err = set(jstr, path, raw, true, false, optimistic, inplace)
+		res, err = set(jstr, path, raw, true, false, optimistic, inplace, cond)
 	case bool:
 		if v {
-			res, err = set(jstr, path, "true", false, false, optimistic, inplace)
+			res, err = set(jstr, path, "true", false, false, optimistic, inplace, cond)
 		} else {
-			res, err = set(jstr, path, "false", false, false, optimistic, inplace)
+			res, err = set(jstr, path, "false", false, false, optimistic, inplace, cond)
 		}
 	case int8:
 		res, err = set(jstr, path, strconv.FormatInt(int64(v), 10),
-			false, false, optimistic, inplace)
+			false, false, optimistic, inplace, cond)
 	case int16:
 		res, err = set(jstr, path, strconv.FormatInt(int64(v), 10),
-			false, false, optimistic, inplace)
+			false, false, optimistic, inplace, cond)
 	case int32:
 		res, err = set(jstr, path, strconv.FormatInt(int64(v), 10),
-			false, false, optimistic, inplace)
+			false, false, optimistic, inplace, cond)
 	case int64:
 		res, err = set(jstr, path, strconv.FormatInt(int64(v), 10),
-			false, false, optimistic, inplace)
+			false, false, optimistic, inplace, cond)
 	case uint8:
 		res, err = set(jstr, path, strconv.FormatUint(uint64(v), 10),
-			false, false, optimistic, inplace)
+			false, false, optimistic, inplace, cond)
 	case uint16:
 		res, err = set(jstr, path, strconv.FormatUint(uint64(v), 10),
-			false, false, optimistic, inplace)
+			false, false, optimistic, inplace, cond)
 	case uint32:
 		res, err = set(jstr, path, strconv.FormatUint(uint64(v), 10),
-			false, false, optimistic, inplace)
+			false, false, optimistic, inplace, cond)
 	case uint64:
 		res, err = set(jstr, path, strconv.FormatUint(uint64(v), 10),
-			false, false, optimistic, inplace)
+			false, false, optimistic, inplace, cond)
 	case float32:
 		res, err = set(jstr, path, strconv.FormatFloat(float64(v), 'f', -1, 64),
-			false, false, optimistic, inplace)
+			false, false, optimistic, inplace, cond)
 	case float64:
 		res, err = set(jstr, path, strconv.FormatFloat(float64(v), 'f', -1, 64),
-			false, false, optimistic, inplace)
+			false, false, optimistic, inplace, cond)
 	}
 	if err == errNoChange {
 		return json, nil
@@ -735,11 +868,13 @@ func SetRawBytesOptions(json []byte, path string, value []byte,
 	jstr := *(*string)(unsafe.Pointer(&json))
 	vstr := *(*string)(unsafe.Pointer(&value))
 	var optimistic, inplace bool
+	var cond Condition
 	if opts != nil {
 		optimistic = opts.Optimistic
 		inplace = opts.ReplaceInPlace
+		cond = opts.Condition
 	}
-	res, err := set(jstr, path, vstr, false, false, optimistic, inplace)
+	res, err := set(jstr, path, vstr, false, false, optimistic, inplace, cond)
 	if err == errNoChange {
 		return json, nil
 	}

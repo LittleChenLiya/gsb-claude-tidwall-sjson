@@ -351,3 +351,181 @@ func TestIssue61(t *testing.T) {
 		t.Fail()
 	}
 }
+
+// TestConditional covers the explicit conditional Set/Delete behavior.
+func TestConditional(t *testing.T) {
+	// CondMissing: a missing value can be set, but an existing null value
+	// must be rejected because the key is present.
+	if out, err := SetIf(`{}`, "a", 1, CondMissing); err != nil || out != `{"a":1}` {
+		t.Fatalf("missing set: got %q err=%v", out, err)
+	}
+	if out, err := SetIf(`{"a":null}`, "a", 1, CondMissing); err != nil || out != `{"a":null}` {
+		t.Fatalf("missing+null rejected: got %q err=%v", out, err)
+	}
+	if out, err := SetIf(`{"a":1}`, "a", 2, CondMissing); err != nil || out != `{"a":1}` {
+		t.Fatalf("missing+number rejected: got %q err=%v", out, err)
+	}
+
+	// CondNull: only an existing null value can be replaced.
+	if out, err := SetIf(`{"a":null}`, "a", 1, CondNull); err != nil || out != `{"a":1}` {
+		t.Fatalf("null set: got %q err=%v", out, err)
+	}
+	if out, err := SetIf(`{"a":1}`, "a", 2, CondNull); err != nil || out != `{"a":1}` {
+		t.Fatalf("null+number rejected: got %q err=%v", out, err)
+	}
+	if out, err := SetIf(`{}`, "a", 1, CondNull); err != nil || out != `{}` {
+		t.Fatalf("null+missing rejected: got %q err=%v", out, err)
+	}
+
+	// CondString: only an existing string value can be replaced.
+	if out, err := SetIf(`{"a":"x"}`, "a", "y", CondString); err != nil || out != `{"a":"y"}` {
+		t.Fatalf("string set: got %q err=%v", out, err)
+	}
+	if out, err := SetIf(`{"a":1}`, "a", "y", CondString); err != nil || out != `{"a":1}` {
+		t.Fatalf("string+number rejected: got %q err=%v", out, err)
+	}
+
+	// CondNumber: only an existing number value can be replaced.
+	if out, err := SetIf(`{"a":1}`, "a", 2, CondNumber); err != nil || out != `{"a":2}` {
+		t.Fatalf("number set: got %q err=%v", out, err)
+	}
+	if out, err := SetIf(`{"a":"x"}`, "a", 2, CondNumber); err != nil || out != `{"a":"x"}` {
+		t.Fatalf("number+string rejected: got %q err=%v", out, err)
+	}
+
+	// CondBool: only an existing boolean value can be replaced.
+	if out, err := SetIf(`{"a":true}`, "a", false, CondBool); err != nil || out != `{"a":false}` {
+		t.Fatalf("bool set: got %q err=%v", out, err)
+	}
+	if out, err := SetIf(`{"a":1}`, "a", false, CondBool); err != nil || out != `{"a":1}` {
+		t.Fatalf("bool+number rejected: got %q err=%v", out, err)
+	}
+
+	// CondObject and CondArray.
+	if out, err := SetRawIf(`{"a":{"b":1}}`, "a", `{"c":2}`, CondObject); err != nil || out != `{"a":{"c":2}}` {
+		t.Fatalf("object set: got %q err=%v", out, err)
+	}
+	if out, err := SetRawIf(`{"a":[1,2]}`, "a", `[3,4]`, CondArray); err != nil || out != `{"a":[3,4]}` {
+		t.Fatalf("array set: got %q err=%v", out, err)
+	}
+	if out, err := SetRawIf(`{"a":1}`, "a", `{}`, CondObject); err != nil || out != `{"a":1}` {
+		t.Fatalf("object+number rejected: got %q err=%v", out, err)
+	}
+
+	// CondNone behaves like the ordinary Set.
+	if out, err := SetIf(`{"a":1}`, "a", 2, CondNone); err != nil || out != `{"a":2}` {
+		t.Fatalf("none set: got %q err=%v", out, err)
+	}
+}
+
+// TestConditionalObjectKeyNotIndex verifies that an object numeric key is
+// never treated as an array index when checking the condition.
+func TestConditionalObjectKeyNotIndex(t *testing.T) {
+	// The object key "0" exists, so CondMissing must be rejected.
+	if out, err := SetIf(`{"0":"x"}`, "0", "y", CondMissing); err != nil || out != `{"0":"x"}` {
+		t.Fatalf("object key 0 + missing rejected: got %q err=%v", out, err)
+	}
+	// The object key "0" is a string, so CondString allows the update.
+	if out, err := SetIf(`{"0":"x"}`, "0", "y", CondString); err != nil || out != `{"0":"y"}` {
+		t.Fatalf("object key 0 + string: got %q err=%v", out, err)
+	}
+	// A nested object key "0" is also not an array index.
+	if out, err := SetIf(`{"a":{"0":"x"}}`, "a.0", "y", CondString); err != nil || out != `{"a":{"0":"y"}}` {
+		t.Fatalf("nested object key 0 + string: got %q err=%v", out, err)
+	}
+	// An array index "0" is still an array index.
+	if out, err := SetIf(`["x"]`, "0", "y", CondString); err != nil || out != `["y"]` {
+		t.Fatalf("array index 0 + string: got %q err=%v", out, err)
+	}
+	// A nested array index "0" is still an array index.
+	if out, err := SetIf(`{"a":["x"]}`, "a.0", "y", CondString); err != nil || out != `{"a":["y"]}` {
+		t.Fatalf("nested array index 0 + string: got %q err=%v", out, err)
+	}
+}
+
+// TestConditionalDelete verifies conditional Delete behavior, including
+// checking the parent type when deleting a nested value.
+func TestConditionalDelete(t *testing.T) {
+	// Delete only when the value is null.
+	if out, err := DeleteIf(`{"a":null,"b":1}`, "a", CondNull); err != nil || out != `{"b":1}` {
+		t.Fatalf("delete null: got %q err=%v", out, err)
+	}
+	// A non-null value is not deleted.
+	if out, err := DeleteIf(`{"a":1,"b":1}`, "a", CondNull); err != nil || out != `{"a":1,"b":1}` {
+		t.Fatalf("delete non-null rejected: got %q err=%v", out, err)
+	}
+	// CondMissing on an existing value is rejected.
+	if out, err := DeleteIf(`{"a":1}`, "a", CondMissing); err != nil || out != `{"a":1}` {
+		t.Fatalf("delete missing+existing rejected: got %q err=%v", out, err)
+	}
+	// CondMissing on a missing value is a no-op.
+	if out, err := DeleteIf(`{"a":1}`, "b", CondMissing); err != nil || out != `{"a":1}` {
+		t.Fatalf("delete missing+missing: got %q err=%v", out, err)
+	}
+	// Deleting a nested value checks the parent type: "a" is an object,
+	// so "b" is a key, not an array index.
+	if out, err := DeleteIf(`{"a":{"b":null}}`, "a.b", CondNull); err != nil || out != `{"a":{}}` {
+		t.Fatalf("delete nested null: got %q err=%v", out, err)
+	}
+	// Deleting an array element by index.
+	if out, err := DeleteIf(`{"a":[1,null,3]}`, "a.1", CondNull); err != nil || out != `{"a":[1,3]}` {
+		t.Fatalf("delete array null: got %q err=%v", out, err)
+	}
+	// A string key into an array parent is not deleted (parent type mismatch).
+	if out, err := DeleteIf(`{"a":[1,2,3]}`, "a.b", CondMissing); err != nil || out != `{"a":[1,2,3]}` {
+		t.Fatalf("delete array string key: got %q err=%v", out, err)
+	}
+}
+
+// TestConditionalRawValueRejected verifies that a malformed raw value is
+// rejected before the condition is checked.
+func TestConditionalRawValueRejected(t *testing.T) {
+	if out, err := SetRawIf(`{"a":1}`, "a", `{bad`, CondString); err == nil || out != `{"a":1}` {
+		t.Fatalf("invalid raw rejected: got %q err=%v", out, err)
+	}
+	if out, err := SetRawBytesIf([]byte(`{"a":1}`), "a", []byte(`[1,`), CondString); err == nil || string(out) != `{"a":1}` {
+		t.Fatalf("invalid raw bytes rejected: got %q err=%v", out, err)
+	}
+	// A valid raw value with a mismatched condition leaves bytes unchanged.
+	if out, err := SetRawIf(`{"a":1}`, "a", `"x"`, CondString); err != nil || out != `{"a":1}` {
+		t.Fatalf("valid raw mismatch: got %q err=%v", out, err)
+	}
+}
+
+// TestConditionalBytesVariants verifies the byte-slice conditional variants.
+func TestConditionalBytesVariants(t *testing.T) {
+	if out, err := SetBytesIf([]byte(`{"a":"x"}`), "a", "y", CondString); err != nil || string(out) != `{"a":"y"}` {
+		t.Fatalf("SetBytesIf: got %q err=%v", out, err)
+	}
+	if out, err := DeleteBytesIf([]byte(`{"a":null}`), "a", CondNull); err != nil || string(out) != `{}` {
+		t.Fatalf("DeleteBytesIf: got %q err=%v", out, err)
+	}
+	if out, err := SetRawBytesIf([]byte(`{"a":1}`), "a", []byte(`2`), CondNumber); err != nil || string(out) != `{"a":2}` {
+		t.Fatalf("SetRawBytesIf: got %q err=%v", out, err)
+	}
+}
+
+// TestConditionalThreeUpdates demonstrates three conditional updates applied
+// in sequence: a missing set, a string update, and a null delete.
+func TestConditionalThreeUpdates(t *testing.T) {
+	json := `{"name":"Tom","age":37}`
+	var err error
+	// 1. Set "name" only if it is a string.
+	json, err = SetIf(json, "name", "Anderson", CondString)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 2. Set "age" only if it is a number.
+	json, err = SetIf(json, "age", 38, CondNumber)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 3. Delete "extra" only if it is null (it is missing, so no-op).
+	json, err = DeleteIf(json, "extra", CondNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if json != `{"name":"Anderson","age":38}` {
+		t.Fatalf("three updates: got %q", json)
+	}
+}

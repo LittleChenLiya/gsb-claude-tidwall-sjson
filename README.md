@@ -213,6 +213,60 @@ println(value)
 // {"friends":["Andy"]}
 ```
 
+Conditional Set and Delete
+---------------------------
+
+A conditional Set or Delete only applies when the existing value at the path
+satisfies a condition. When the condition is not met, the input bytes are
+returned unchanged. The condition is verified at the real target position
+using the same parse state as the update, so object numeric keys are never
+mistaken for array indices.
+
+```go
+value, _ := sjson.SetIf(`{"name":"Tom","age":37}`, "name", "Anderson", sjson.CondString)
+println(value)
+
+// Output:
+// {"name":"Anderson","age":37}
+```
+
+The available conditions are:
+
+- `CondNone` — no condition (same as an unconditional Set or Delete).
+- `CondMissing` — the path must not exist. An existing `null` value is rejected.
+- `CondNull` — the existing value must be JSON null.
+- `CondString` — the existing value must be a JSON string.
+- `CondNumber` — the existing value must be a JSON number.
+- `CondBool` — the existing value must be a JSON boolean.
+- `CondObject` — the existing value must be a JSON object.
+- `CondArray` — the existing value must be a JSON array.
+
+```go
+// Set only when the path is missing.
+value, _ := sjson.SetIf(`{}`, "name", "Tom", sjson.CondMissing)
+
+// Set only when the existing value is a string.
+value, _ := sjson.SetIf(`{"name":"Tom"}`, "name", "Anderson", sjson.CondString)
+
+// Delete only when the existing value is null.
+value, _ := sjson.DeleteIf(`{"name":null}`, "name", sjson.CondNull)
+```
+
+The `Condition` field can also be set on `Options`:
+
+```go
+value, _ := sjson.SetOptions(`{"name":"Tom"}`, "name", "Anderson",
+    &sjson.Options{Condition: sjson.CondString})
+```
+
+Raw values are validated before the condition is checked, so a malformed raw
+value is rejected first:
+
+```go
+_, err := sjson.SetRawIf(`{"a":1}`, "a", `{bad`, sjson.CondString)
+// err != nil
+```
+
 ## Performance
 
 Benchmarks of SJSON alongside [encoding/json](https://golang.org/pkg/encoding/json/), 
